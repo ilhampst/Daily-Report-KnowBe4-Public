@@ -1,0 +1,589 @@
+/**
+ * KnowBe4 Training Report — Google Apps Script (Template)
+ * ========================================================
+ * Runs entirely inside Google Sheets. No Python, no local install needed.
+ *
+ * Pulls training-enrollment status from the KnowBe4 API, splits users into
+ * per-site tabs, and builds a SUMMARY tab with completion ratios.
+ *
+ * This is a GENERIC TEMPLATE. To adapt it to your organization you only need to
+ * edit the data near the top of this file — the matching logic stays the same:
+ *   • SITE_RULES      → your site / company → tab mapping
+ *   • EXCLUDED_EMAILS → vendor / external accounts to drop
+ * See the "Adapting this template" section in the README for details.
+ *
+ * Output format per tab (7 columns, one row per user per module):
+ *   Email | First Name | Last Name | Manager Name | Manager Email | Content | Status
+ *
+ * SETUP (one-time, ~5 minutes):
+ *   1. Open a new Google Sheet
+ *   2. Extensions → Apps Script
+ *   3. Paste this entire file, replacing the default content
+ *   4. Click the gear icon (Project Settings) → Script Properties
+ *      Add property:  KB4_API_KEY      = your_api_key_here
+ *      Add property:  KB4_CAMPAIGN_ID  = your_campaign_id  (or leave blank for auto-detect)
+ *   5. Save the script (Ctrl+S)
+ *   6. Reload the Google Sheet — a new "KnowBe4 Report" menu will appear
+ *   7. Click KnowBe4 Report → Refresh Now
+ *      (First run: approve the permission popup — this is normal)
+ *
+ * SECURITY:
+ *   NEVER hardcode your API key in this file. Store it in Script Properties
+ *   (Project Settings → Script Properties → KB4_API_KEY). The key only ever
+ *   lives in the project's properties store, never in source you might publish.
+ *
+ * SCHEDULED AUTO-REFRESH:
+ *   In Apps Script: click the clock icon (Triggers) → Add Trigger
+ *   Function: refreshReport | Event: Time-driven | Every day at 7am
+ */
+
+// ── Site rules: order matters — first match wins ──────────────────────────────
+// Each entry: [tab label, full company name, [keywords], locationOnly?]
+// Keywords are checked against Location first, then Group (as fallback) — UNLESS
+// locationOnly is true, in which case ONLY the Location field is checked.
+//
+// HQ and BR are location-based and MUST come first: a user at "Company A
+// Headquarters Office" belongs in HQ, not SITE_A. They are locationOnly because
+// the Group field often contains catch-all values like "All HQ Office Users"
+// even for staff who actually report to a different site.
+//
+// >>> EDIT THIS for your own organization. <<<
+// Replace the placeholder tab codes, company names, and keywords below. Add or
+// remove rows freely — the matching logic does not care how many there are.
+const SITE_RULES = [
+  // ── Location-only rules (put these FIRST) ──────────────────────────────────
+  // Use for offices that should "win" over company membership: anyone physically
+  // at this location lands here regardless of which company they belong to.
+  ["HQ",  "Headquarters Office (All Companies)", ["HEADQUARTERS", "HQ CITY"], true ],
+  ["BR",  "Branch Office",                       ["BRANCH CITY"],            true ],
+
+  // ── Company / site rules ───────────────────────────────────────────────────
+  // One row per site. Matched on Location first, then Group as a fallback
+  // (locationOnly = false). Copy a line to add another site.
+  ["SITE_A", "Company A", ["SITE_A", "COMPANY A KEYWORD"], false],
+  ["SITE_B", "Company B", ["SITE_B", "COMPANY B KEYWORD"], false],
+  ["SITE_C", "Company C", ["SITE_C", "COMPANY C KEYWORD"], false],
+  ["SITE_D", "Company D", ["SITE_D", "COMPANY D KEYWORD"], false],
+  ["SITE_E", "Company E", ["SITE_E", "COMPANY E KEYWORD"], false],
+  ["SITE_F", "Company F", ["SITE_F", "COMPANY F KEYWORD"], false],
+
+  // ── Parent / holding company (multiple keywords) ───────────────────────────
+  // A rule may list several keywords; any match assigns the tab. Keep broad
+  // rules like a parent/holding company LAST so specific sites match first.
+  ["GROUP_HO", "Parent Group (Holding)", ["GROUP", "HOLDING", "CORPORATE"], false],
+];
+const OTHER_TAB = "OTHER";
+
+const STATUS_LABELS = {
+  "passed":      "Passed",
+  "past_due":    "Past Due",
+  "in_progress": "In Progress",
+  "not_started": "Not Started",
+};
+
+const COLOR_HEADER_BG  = "#375623";
+const COLOR_PASSED_BG  = "#E2EFDA";
+const COLOR_PASTDUE_BG = "#FCE4D6";
+
+// ── Menu ──────────────────────────────────────────────────────────────────────
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("KnowBe4 Report")
+    .addItem("🔄 Refresh Now", "refreshReport")
+    .addItem("👥 Refresh User Data", "clearUserCache")
+    .addItem("⚙️ Set API Key", "promptApiKey")
+    .addToUi();
+}
+
+function promptApiKey() {
+  const ui = SpreadsheetApp.getUi();
+  const result = ui.prompt("Enter your KnowBe4 API Key:", ui.ButtonSet.OK_CANCEL);
+  if (result.getSelectedButton() === ui.Button.OK) {
+    PropertiesService.getScriptProperties().setProperty("KB4_API_KEY", result.getResponseText().trim());
+    ui.alert("API key saved.");
+  }
+}
+
+// ── Main entry point ──────────────────────────────────────────────────────────
+
+function refreshReport() {
+  const props      = PropertiesService.getScriptProperties();
+  const apiKey     = props.getProperty("KB4_API_KEY");
+  const campaignId = props.getProperty("KB4_CAMPAIGN_ID") || "";
+
+  if (!apiKey) {
+    SpreadsheetApp.getUi().alert("API key not set. Use KnowBe4 Report → Set API Key.");
+    return;
+  }
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  ss.toast("Fetching data from KnowBe4...", "KnowBe4 Report", 60);
+
+  try {
+    const cid         = campaignId || getActiveCampaignId(apiKey);
+    const enrollments = fetchAllEnrollments(apiKey, cid);  // flat rows, one per user per module
+    const tabsData    = groupByTab(enrollments);           // { tab: [row, row, ...] }
+
+    writeSummarySheet(ss, tabsData);
+    writeSiteSheets(ss, tabsData);
+    cleanupUnusedSheets(ss, tabsData);
+
+    const ts = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm");
+    ss.toast(`Done! Updated ${ts}`, "KnowBe4 Report ✓", 5);
+
+  } catch (e) {
+    ss.toast("Error: " + e.message, "KnowBe4 Report ✗", 10);
+    console.error(e);
+    throw e;
+  }
+}
+
+// ── API Helpers ───────────────────────────────────────────────────────────────
+
+function apiGet(apiKey, path, params) {
+  const base = "https://us.api.knowbe4.com/v1";
+  let all = [], page = 1;
+  while (true) {
+    const qp = Object.entries({ per_page: 500, page, ...params })
+      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");
+    const res = UrlFetchApp.fetch(`${base}${path}?${qp}`, {
+      headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
+      muteHttpExceptions: true,
+    });
+    if (res.getResponseCode() !== 200)
+      throw new Error(`API error ${res.getResponseCode()}: ${res.getContentText().substring(0, 200)}`);
+    const data = JSON.parse(res.getContentText());
+    if (!data || (Array.isArray(data) && data.length === 0)) break;
+    if (Array.isArray(data)) {
+      all = all.concat(data);
+      if (data.length < 500) break;
+      page++;
+    } else {
+      return data;
+    }
+  }
+  return all;
+}
+
+function getActiveCampaignId(apiKey) {
+  const campaigns = apiGet(apiKey, "/training/campaigns", {});
+  const active    = campaigns.filter(c => c.status === "Active");
+  const list      = active.length ? active : campaigns;
+  if (!list.length) throw new Error("No training campaigns found in KnowBe4.");
+  return list[0].id;
+}
+
+// How often to re-fetch the full user list (profile data: location, groups, manager).
+// Status is always fetched fresh; only this profile lookup is cached.
+const USER_CACHE_HOURS = 24;
+const USER_CACHE_SHEET = "_USERCACHE";
+
+function fetchUserLookup(apiKey) {
+  // The enrollment endpoint only returns id/name/email — NOT location/groups/manager.
+  // User profile data changes rarely, so we cache it in a hidden sheet and only
+  // re-fetch from the API when the cache is older than USER_CACHE_HOURS.
+  const cached = readUserCache();
+  if (cached) {
+    Logger.log("Using cached user lookup (age within " + USER_CACHE_HOURS + "h)");
+    return cached;
+  }
+
+  Logger.log("User cache stale or missing — fetching fresh from /users");
+  const users = apiGet(apiKey, "/users", {});
+  const lookup = {};
+  for (const u of users) {
+    lookup[u.id] = {
+      managerName:  u.manager_name  || "",
+      managerEmail: u.manager_email || "",
+      location:     u.location      || "",
+      group:        (u.groups || []).join(", "),   // groups is an array of names
+      division:     u.division      || "",
+      organization: u.organization  || "",
+    };
+  }
+  writeUserCache(lookup);
+  return lookup;
+}
+
+function readUserCache() {
+  // Returns the cached lookup if fresh, else null
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(USER_CACHE_SHEET);
+  if (!sh || sh.getLastRow() < 2) return null;
+
+  const cachedAt = sh.getRange("A1").getValue();   // ISO timestamp string
+  if (!cachedAt) return null;
+  const ageMs = Date.now() - new Date(cachedAt).getTime();
+  if (ageMs > USER_CACHE_HOURS * 3600 * 1000) return null;   // stale
+
+  // Rebuild lookup from rows: id | managerName | managerEmail | location | group | division | organization
+  const rows = sh.getRange(2, 1, sh.getLastRow() - 1, 7).getValues();
+  const lookup = {};
+  for (const row of rows) {
+    lookup[row[0]] = {
+      managerName:  row[1], managerEmail: row[2], location: row[3],
+      group:        row[4], division:     row[5], organization: row[6],
+    };
+  }
+  return lookup;
+}
+
+function writeUserCache(lookup) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(USER_CACHE_SHEET);
+  if (!sh) sh = ss.insertSheet(USER_CACHE_SHEET);
+  sh.clear();
+
+  // A1 holds the cache timestamp
+  sh.getRange("A1").setValue(new Date().toISOString());
+
+  const rows = Object.entries(lookup).map(([id, info]) => [
+    id, info.managerName, info.managerEmail, info.location,
+    info.group, info.division, info.organization,
+  ]);
+  if (rows.length) {
+    sh.getRange(2, 1, rows.length, 7).setValues(rows);
+  }
+  sh.hideSheet();   // keep it out of the way
+}
+
+function clearUserCache() {
+  // Manual override — call this (or use the menu) to force a fresh user fetch next run
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(USER_CACHE_SHEET);
+  if (sh) ss.deleteSheet(sh);
+  SpreadsheetApp.getUi().alert("User cache cleared. Next refresh will re-fetch all users.");
+}
+
+// Emails to exclude entirely from the report:
+//  - any address whose local part starts with "V_" (external/vendor accounts)
+//  - specific vendor/external accounts listed below
+// >>> EDIT THIS: add the external/vendor addresses you want dropped. <<<
+const EXCLUDED_EMAILS = ["vendor@example.com"];
+
+function isExcludedEmail(email) {
+  const e = (email || "").trim().toLowerCase();
+  if (!e) return false;
+  if (e.startsWith("v_")) return true;                 // V_xxx vendor/external prefix
+  if (EXCLUDED_EMAILS.includes(e)) return true;          // specific vendor account(s)
+  return false;
+}
+
+function fetchAllEnrollments(apiKey, campaignId) {
+  // User profile lookup (cached); status always fetched fresh below
+  const userLookup = fetchUserLookup(apiKey);
+
+  // Returns flat array — one object per enrollment row (user × module)
+  const records = apiGet(apiKey, "/training/enrollments", { campaign_id: campaignId });
+  return records
+    .filter(r => !isExcludedEmail(r.user?.email))   // drop V_xxx and vendor accounts
+    .map(r => {
+      const uid  = r.user?.id;
+      const info = userLookup[uid] || {};
+      return {
+        email:        (r.user?.email     || "").trim(),
+        firstName:    r.user?.first_name || "",
+        lastName:     r.user?.last_name  || "",
+        managerName:  info.managerName   || "",
+        managerEmail: info.managerEmail  || "",
+        location:     info.location      || "",
+        // Match priority: Location → Group → Division → Organization
+        group:        [info.group, info.division, info.organization].filter(Boolean).join(", "),
+        content:      r.content_title    || r.module_name || "",
+        status:       STATUS_LABELS[r.status?.toLowerCase()] || r.status || "",
+      };
+    });
+}
+
+// ── Data Processing ───────────────────────────────────────────────────────────
+
+function assignTab(location, group) {
+  const locU = (location || "").toUpperCase();
+  const grpU = (group    || "").toUpperCase();
+
+  // PASS 1 — Location is authoritative. Check ALL rules against Location first.
+  // A real location like "Company A Site" must win over any group membership,
+  // so we never look at Group until every rule has had a shot at Location.
+  if (locU) {
+    for (const [tab, , keywords] of SITE_RULES) {
+      if (keywords.some(kw => locU.includes(kw))) return tab;
+    }
+  }
+
+  // PASS 2 — Only if Location matched nothing, fall back to Group.
+  // Skip locationOnly rules (HQ/BR): those must come from Location alone,
+  // because the Group field often contains catch-all values like
+  // "All HQ Office Users" for staff who report elsewhere.
+  if (grpU) {
+    for (const [tab, , keywords, locationOnly] of SITE_RULES) {
+      if (locationOnly) continue;
+      if (keywords.some(kw => grpU.includes(kw))) return tab;
+    }
+  }
+
+  return OTHER_TAB;
+}
+
+// Tabs to exclude from the report output entirely.
+// After filtering out V_xxx/vendor accounts, these tabs typically hold no real
+// site users (e.g. a parent/holding bucket and the OTHER catch-all).
+// >>> EDIT THIS if you want those tabs rendered, or to exclude different ones. <<<
+const EXCLUDED_TABS = ["GROUP_HO", OTHER_TAB];
+
+function groupByTab(enrollments) {
+  const tabOrder = [...SITE_RULES.map(r => r[0]), OTHER_TAB];
+  const tabs = {};
+
+  for (const row of enrollments) {
+    const tab = assignTab(row.location, row.group);
+    if (!tabs[tab]) tabs[tab] = [];
+    tabs[tab].push(row);
+  }
+
+  // Sort each tab: Last Name → First Name → Content
+  for (const tab of Object.keys(tabs)) {
+    tabs[tab].sort((a, b) => {
+      const key = r => `${r.lastName}|${r.firstName}|${r.content}`.toLowerCase();
+      return key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0;
+    });
+  }
+
+  // Return in defined order, skipping excluded tabs
+  const ordered = {};
+  for (const t of tabOrder) {
+    if (tabs[t] && !EXCLUDED_TABS.includes(t)) ordered[t] = tabs[t];
+  }
+  return ordered;
+}
+
+// ── Sheet Helpers ─────────────────────────────────────────────────────────────
+
+function getOrCreateSheet(ss, name) {
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  // Remove any existing filter first — otherwise createFilter() throws on re-run
+  const existingFilter = sh.getFilter();
+  if (existingFilter) existingFilter.remove();
+  sh.clear();
+  return sh;
+}
+
+function styleHeaderRow(sheet, numCols) {
+  sheet.getRange(1, 1, 1, numCols)
+    .setBackground(COLOR_HEADER_BG)
+    .setFontColor("#FFFFFF")
+    .setFontFamily("Arial")
+    .setFontSize(10)
+    .setFontWeight("bold")
+    .setHorizontalAlignment("center")
+    .setVerticalAlignment("middle")
+    .setWrap(true);
+  sheet.setRowHeight(1, 32);
+}
+
+// ── Summary Sheet ─────────────────────────────────────────────────────────────
+
+function getUserCacheTimestamp() {
+  // Reads the timestamp stored in _USERCACHE!A1 (set when user data was last fetched)
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(USER_CACHE_SHEET);
+  if (!sh) return null;
+  const v = sh.getRange("A1").getValue();
+  return v ? new Date(v) : null;
+}
+
+function fmtTimestamp(date) {
+  if (!date) return "Unknown";
+  return Utilities.formatDate(date, Session.getScriptTimeZone(), "d MMM yyyy, HH:mm") +
+         " " + Session.getScriptTimeZone();
+}
+
+function writeSummarySheet(ss, tabsData) {
+  const sh         = getOrCreateSheet(ss, "SUMMARY");
+  const companyMap = Object.fromEntries(SITE_RULES.map(r => [r[0], r[1]]));
+
+  // Rows 1-2 hold the freshness timestamps; the table header starts at row 3.
+  const HEADER_ROW = 3;
+
+  // ── Freshness info block (rows 1-2) ─────────────────────────────────────────
+  const statusTs = new Date();                  // this refresh = now
+  const userTs   = getUserCacheTimestamp();     // when user profiles were last fetched
+
+  sh.getRange("A1").setValue("Last status update:")
+    .setFontWeight("bold").setFontFamily("Arial").setFontSize(10);
+  sh.getRange("B1").setValue(fmtTimestamp(statusTs))
+    .setFontFamily("Arial").setFontSize(10);
+
+  sh.getRange("A2").setValue("Last user data update:")
+    .setFontWeight("bold").setFontFamily("Arial").setFontSize(10);
+  sh.getRange("B2").setValue(fmtTimestamp(userTs))
+    .setFontFamily("Arial").setFontSize(10);
+
+  // Collect all unique modules in order of appearance
+  const allModules = [];
+  for (const rows of Object.values(tabsData)) {
+    for (const r of rows) {
+      if (r.content && !allModules.includes(r.content)) allModules.push(r.content);
+    }
+  }
+
+  const headers = ["Tab", "Company", "Total Users", ...allModules, "Completion Ratio %"];
+  sh.getRange(HEADER_ROW, 1, 1, headers.length).setValues([headers]);
+  // Style header row (at HEADER_ROW instead of row 1)
+  sh.getRange(HEADER_ROW, 1, 1, headers.length)
+    .setBackground(COLOR_HEADER_BG).setFontColor("#FFFFFF").setFontFamily("Arial")
+    .setFontSize(10).setFontWeight("bold").setHorizontalAlignment("center")
+    .setVerticalAlignment("middle").setWrap(true);
+  sh.setRowHeight(HEADER_ROW, 32);
+
+  const dataRows = [];
+
+  // Running grand totals across ALL sites (V_xxx and vendor already excluded upstream)
+  const grandUsers       = new Set();
+  const grandModPass     = allModules.map(() => 0);
+  const grandModTotal    = allModules.map(() => 0);
+  let   grandPass = 0, grandPossible = 0;
+
+  for (const [tab, rows] of Object.entries(tabsData)) {
+    const uniqueUsers  = new Set(rows.map(r => r.email.toLowerCase())).size;
+    let totalPass = 0, totalPossible = 0;
+
+    rows.forEach(r => grandUsers.add(r.email.toLowerCase()));
+
+    const modCounts = allModules.map((mod, mi) => {
+      const modRows = rows.filter(r => r.content === mod);
+      const passed  = modRows.filter(r => r.status.includes("Passed")).length;
+      const total   = new Set(modRows.map(r => r.email.toLowerCase())).size;
+      totalPass     += passed;
+      totalPossible += total;
+      grandModPass[mi]  += passed;
+      grandModTotal[mi] += total;
+      return `${passed}/${total}`;
+    });
+
+    grandPass     += totalPass;
+    grandPossible += totalPossible;
+
+    const pct = totalPossible ? Math.round(totalPass / totalPossible * 100) : 0;
+    dataRows.push([tab, companyMap[tab] || tab, uniqueUsers, ...modCounts, `${pct}%`]);
+  }
+
+  // Grand-total row: completion ratio across all sites
+  const grandPct = grandPossible ? Math.round(grandPass / grandPossible * 100) : 0;
+  const grandModCounts = allModules.map((_, mi) => `${grandModPass[mi]}/${grandModTotal[mi]}`);
+  const totalRow = ["ALL", "All Sites (excl. V_ & vendor)", grandUsers.size,
+                    ...grandModCounts, `${grandPct}%`];
+
+  if (dataRows.length) {
+    const firstDataRow = HEADER_ROW + 1;
+    sh.getRange(firstDataRow, 1, dataRows.length, headers.length)
+      .setValues(dataRows)
+      .setFontFamily("Arial")
+      .setFontSize(10)
+      .setVerticalAlignment("middle");
+
+    // Center numeric/count columns
+    sh.getRange(firstDataRow, 3, dataRows.length, headers.length - 2).setHorizontalAlignment("center");
+
+    // Color the Completion Ratio % column
+    for (let ri = 0; ri < dataRows.length; ri++) {
+      const pctVal = parseInt(dataRows[ri][headers.length - 1]);
+      sh.getRange(firstDataRow + ri, headers.length)
+        .setBackground(pctVal >= 80 ? COLOR_PASSED_BG : COLOR_PASTDUE_BG)
+        .setFontWeight("bold");
+    }
+  }
+
+  // Write grand-total row below the per-site rows, with emphasis
+  const totalRowIndex = HEADER_ROW + dataRows.length + 1;
+  sh.getRange(totalRowIndex, 1, 1, headers.length)
+    .setValues([totalRow])
+    .setFontFamily("Arial")
+    .setFontSize(10)
+    .setFontWeight("bold")
+    .setBackground("#D9E1F2")
+    .setVerticalAlignment("middle");
+  sh.getRange(totalRowIndex, 3, 1, headers.length - 2).setHorizontalAlignment("center");
+
+  // Column widths
+  sh.setColumnWidth(1, 80);
+  sh.setColumnWidth(2, 260);
+  sh.setColumnWidth(3, 100);
+  for (let i = 0; i < allModules.length; i++) sh.setColumnWidth(4 + i, 340);
+  sh.setColumnWidth(headers.length, 140);
+  sh.setFrozenRows(HEADER_ROW);   // freeze timestamps + header so they stay visible
+  ss.setActiveSheet(sh);
+  ss.moveActiveSheet(1);
+}
+
+// ── Site Sheets ───────────────────────────────────────────────────────────────
+
+function writeSiteSheets(ss, tabsData) {
+  // Fixed 8-column format: Email | First Name | Last Name | Manager Name | Manager Email | Location | Content | Status
+  const headers = ["Email", "First Name", "Last Name", "Manager Name", "Manager Email", "Location", "Content", "Status"];
+  let sheetPos  = 2;
+
+  const statusStamp = fmtTimestamp(new Date());
+  const userStamp   = fmtTimestamp(getUserCacheTimestamp());
+
+  for (const [tab, rows] of Object.entries(tabsData)) {
+    const sh = getOrCreateSheet(ss, tab);
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+    styleHeaderRow(sh, headers.length);
+
+    // Freshness note just right of the table, row 1
+    sh.getRange(1, headers.length + 2)
+      .setValue(`Status: ${statusStamp}  |  User data: ${userStamp}`)
+      .setFontFamily("Arial").setFontSize(9).setFontColor("#666666");
+
+    if (rows.length) {
+      const dataRows = rows.map(r => [
+        r.email, r.firstName, r.lastName, r.managerName, r.managerEmail,
+        r.location, r.content, r.status,
+      ]);
+
+      sh.getRange(2, 1, dataRows.length, headers.length)
+        .setValues(dataRows)
+        .setFontFamily("Arial")
+        .setFontSize(10)
+        .setVerticalAlignment("middle");
+
+      // Color the Status column (col 8)
+      for (let ri = 0; ri < dataRows.length; ri++) {
+        const status = dataRows[ri][7] || "";
+        const cell   = sh.getRange(ri + 2, 8);
+        cell.setHorizontalAlignment("center");
+        if (status.includes("Passed"))   cell.setBackground(COLOR_PASSED_BG);
+        else if (status.includes("Past")) cell.setBackground(COLOR_PASTDUE_BG);
+      }
+    }
+
+    // Column widths
+    sh.setColumnWidth(1, 280);  // Email
+    sh.setColumnWidth(2, 120);  // First Name
+    sh.setColumnWidth(3, 120);  // Last Name
+    sh.setColumnWidth(4, 200);  // Manager Name
+    sh.setColumnWidth(5, 280);  // Manager Email
+    sh.setColumnWidth(6, 200);  // Location
+    sh.setColumnWidth(7, 340);  // Content
+    sh.setColumnWidth(8, 120);  // Status
+
+    sh.setFrozenRows(1);
+    if (sh.getLastRow() > 1) sh.getRange(1, 1, sh.getLastRow(), headers.length).createFilter();
+
+    ss.setActiveSheet(sh);
+    ss.moveActiveSheet(sheetPos++);
+  }
+}
+
+// ── Cleanup ───────────────────────────────────────────────────────────────────
+
+function cleanupUnusedSheets(ss, tabsData) {
+  const keepNames = new Set(["SUMMARY", ...Object.keys(tabsData)]);
+  for (const sh of ss.getSheets()) {
+    if (!keepNames.has(sh.getName()) && /^[A-Z0-9\-_]{2,8}$/.test(sh.getName())) {
+      ss.deleteSheet(sh);
+    }
+  }
+}
